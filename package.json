@@ -1,0 +1,25 @@
+{
+  "name": "stylus-cache-sentinel",
+  "version": "0.1.0",
+  "description": "Indexer for Arbitrum Stylus CacheManager bids and evictions",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "sync": "ts-node src/index.ts sync",
+    "status": "ts-node src/index.ts status"
+  },
+  "dependencies": {
+    "viem": "^2.21.0",
+    "better-sqlite3": "^11.6.0",
+    "dotenv": "^16.4.5",
+    "chalk": "^4.1.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "ts-node": "^10.9.2",
+    "@types/node": "^22.0.0",
+    "@types/better-sqlite3": "^7.6.12"
+  }
+}
