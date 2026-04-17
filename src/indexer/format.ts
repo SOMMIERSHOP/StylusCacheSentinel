@@ -1,18 +1,34 @@
 import { parseEventLogs, type Log, type PublicClient } from "viem";
 import { cacheManagerAbi } from "../abi";
+import type {
+  ParsedBid,
+  ParsedEviction,
+  ParsedConfigEvent,
+} from "../db/store";
 import chalk from "chalk";
 
-// shared log formatter for backfill + tail
-export function logParsedEvents(
+export interface ParsedBatch {
+  bids: ParsedBid[];
+  evictions: ParsedEviction[];
+  configEvents: ParsedConfigEvent[];
+}
+
+// pure parser — produces row arrays ready for persistence
+export function parseEvents(
   logs: Log[],
   timestamps: Map<number, number>
-): void {
+): ParsedBatch {
   const parsed = parseEventLogs({ abi: cacheManagerAbi, logs });
+  const batch: ParsedBatch = { bids: [], evictions: [], configEvents: [] };
 
   for (const event of parsed) {
-    const blockNum = Number(event.blockNumber);
-    const ts = timestamps.get(blockNum) ?? 0;
-    const date = new Date(ts * 1000).toISOString();
+    const blockNumber = Number(event.blockNumber);
+    const timestamp = timestamps.get(blockNumber) ?? 0;
+    const txHash = event.transactionHash as `0x${string}` | null;
+    const logIndex = event.logIndex;
+
+    // mined logs always have these; skip pending logs defensively
+    if (txHash == null || logIndex == null) continue;
 
     if (event.eventName === "InsertBid") {
       const args = event.args as {
@@ -21,52 +37,135 @@ export function logParsedEvents(
         bid: bigint;
         size: bigint;
       };
-      console.log(
-        chalk.green(`  [InsertBid]`) +
-          chalk.white(` block=${blockNum} ${date}`) +
-          chalk.gray(
-            `\n    program=${args.program}  bid=${args.bid} wei  size=${args.size} bytes` +
-              `\n    codehash=${args.codehash}  tx=${event.transactionHash}`
-          )
-      );
+      batch.bids.push({
+        codehash: args.codehash,
+        program: args.program,
+        bidWei: args.bid.toString(),
+        size: Number(args.size),
+        blockNumber,
+        txHash,
+        logIndex,
+        timestamp,
+      });
     } else if (event.eventName === "DeleteBid") {
       const args = event.args as {
         codehash: `0x${string}`;
         bid: bigint;
         size: bigint;
       };
-      console.log(
-        chalk.red(`  [DeleteBid]`) +
-          chalk.white(` block=${blockNum} ${date}`) +
-          chalk.gray(
-            `\n    bid=${args.bid} wei  size=${args.size} bytes` +
-              `\n    codehash=${args.codehash}  tx=${event.transactionHash}`
-          )
-      );
+      batch.evictions.push({
+        codehash: args.codehash,
+        bidWei: args.bid.toString(),
+        size: Number(args.size),
+        blockNumber,
+        txHash,
+        logIndex,
+        timestamp,
+      });
     } else if (event.eventName === "SetCacheSize") {
       const args = event.args as { size: bigint };
-      console.log(
-        chalk.yellow(`  [SetCacheSize]`) +
-          chalk.white(` block=${blockNum} ${date}`) +
-          chalk.gray(`  size=${args.size}`)
-      );
+      batch.configEvents.push({
+        eventType: "SetCacheSize",
+        value: args.size.toString(),
+        blockNumber,
+        txHash,
+        logIndex,
+        timestamp,
+      });
     } else if (event.eventName === "SetDecayRate") {
       const args = event.args as { decay: bigint };
-      console.log(
-        chalk.yellow(`  [SetDecayRate]`) +
-          chalk.white(` block=${blockNum} ${date}`) +
-          chalk.gray(`  decay=${args.decay}`)
-      );
+      batch.configEvents.push({
+        eventType: "SetDecayRate",
+        value: args.decay.toString(),
+        blockNumber,
+        txHash,
+        logIndex,
+        timestamp,
+      });
     } else if (event.eventName === "Pause") {
-      console.log(
-        chalk.red(`  [Pause]`) + chalk.white(` block=${blockNum} ${date}`)
-      );
+      batch.configEvents.push({
+        eventType: "Pause",
+        value: null,
+        blockNumber,
+        txHash,
+        logIndex,
+        timestamp,
+      });
     } else if (event.eventName === "Unpause") {
-      console.log(
-        chalk.green(`  [Unpause]`) + chalk.white(` block=${blockNum} ${date}`)
-      );
+      batch.configEvents.push({
+        eventType: "Unpause",
+        value: null,
+        blockNumber,
+        txHash,
+        logIndex,
+        timestamp,
+      });
     }
   }
+
+  return batch;
+}
+
+// pretty-print a parsed batch (used by the live tail for visibility)
+export function logParsedBatch(batch: ParsedBatch): void {
+  const all: { block: number; render: () => void }[] = [];
+
+  for (const b of batch.bids) {
+    all.push({
+      block: b.blockNumber,
+      render: () => {
+        const date = new Date(b.timestamp * 1000).toISOString();
+        console.log(
+          chalk.green(`  [InsertBid]`) +
+            chalk.white(` block=${b.blockNumber} ${date}`) +
+            chalk.gray(
+              `\n    program=${b.program}  bid=${b.bidWei} wei  size=${b.size} bytes` +
+                `\n    codehash=${b.codehash}  tx=${b.txHash}`
+            )
+        );
+      },
+    });
+  }
+
+  for (const e of batch.evictions) {
+    all.push({
+      block: e.blockNumber,
+      render: () => {
+        const date = new Date(e.timestamp * 1000).toISOString();
+        console.log(
+          chalk.red(`  [DeleteBid]`) +
+            chalk.white(` block=${e.blockNumber} ${date}`) +
+            chalk.gray(
+              `\n    bid=${e.bidWei} wei  size=${e.size} bytes` +
+                `\n    codehash=${e.codehash}  tx=${e.txHash}`
+            )
+        );
+      },
+    });
+  }
+
+  for (const c of batch.configEvents) {
+    all.push({
+      block: c.blockNumber,
+      render: () => {
+        const date = new Date(c.timestamp * 1000).toISOString();
+        const label =
+          c.eventType === "Pause"
+            ? chalk.red(`  [Pause]`)
+            : c.eventType === "Unpause"
+              ? chalk.green(`  [Unpause]`)
+              : chalk.yellow(`  [${c.eventType}]`);
+        console.log(
+          label +
+            chalk.white(` block=${c.blockNumber} ${date}`) +
+            (c.value !== null ? chalk.gray(`  value=${c.value}`) : "")
+        );
+      },
+    });
+  }
+
+  all.sort((a, b) => a.block - b.block);
+  for (const entry of all) entry.render();
 }
 
 // bulk-fetch timestamps, dedupes block numbers first

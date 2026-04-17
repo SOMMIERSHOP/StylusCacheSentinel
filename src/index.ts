@@ -3,6 +3,7 @@ import { resolveCacheManager } from "./resolver";
 import { readCacheState } from "./indexer/state";
 import { backfill } from "./indexer/backfill";
 import { startTail } from "./indexer/tail";
+import { reconcile, printReconcileReport } from "./indexer/reconcile";
 import { getClient } from "./provider";
 
 // Stylus went live on Arbitrum One around Sep 3 2024.
@@ -72,6 +73,14 @@ async function cmdStatus() {
   console.log();
 }
 
+async function cmdReconcile() {
+  console.log(chalk.cyan("\n  Stylus Cache Sentinel — reconcile\n"));
+  const cacheManager = await resolveCacheManager();
+  const report = await reconcile(cacheManager);
+  printReconcileReport(report);
+  process.exit(report.ok ? 0 : 1);
+}
+
 async function main() {
   const command = process.argv[2] || "sync";
 
@@ -83,10 +92,14 @@ async function main() {
       case "status":
         await cmdStatus();
         break;
+      case "reconcile":
+        await cmdReconcile();
+        break;
       default:
-        console.log("Usage: sentinel <sync|status>");
-        console.log("  sync   — scan history + tail new CacheManager events");
-        console.log("  status — show current on-chain cache state");
+        console.log("Usage: sentinel <sync|status|reconcile>");
+        console.log("  sync      — scan history + tail new CacheManager events");
+        console.log("  status    — show current on-chain cache state");
+        console.log("  reconcile — compare DB-derived state against on-chain state");
         process.exit(1);
     }
   } catch (err: any) {

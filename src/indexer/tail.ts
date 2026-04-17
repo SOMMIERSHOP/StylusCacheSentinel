@@ -1,10 +1,12 @@
 import { type Log } from "viem";
 import { getClient } from "../provider";
 import { config } from "../config";
-import { logParsedEvents, getBlockTimestamps } from "./format";
+import { parseEvents, logParsedBatch, getBlockTimestamps } from "./format";
+import { persistParsedEvents } from "../db/store";
 import chalk from "chalk";
 
-// poll for new events after backfill finishes
+// poll for new events after backfill finishes, persist each tick and
+// advance the checkpoint. Dedup'd via UNIQUE(tx_hash, log_index).
 export async function startTail(
   cacheManagerAddr: `0x${string}`,
   fromBlock: number,
@@ -34,11 +36,19 @@ export async function startTail(
         const blockNums = logs
           .filter((l) => l.blockNumber != null)
           .map((l) => Number(l.blockNumber));
-
-        if (blockNums.length > 0) {
-          const timestamps = await getBlockTimestamps(blockNums, client);
-          logParsedEvents(logs as Log[], timestamps);
-        }
+        const timestamps = blockNums.length
+          ? await getBlockTimestamps(blockNums, client)
+          : new Map<number, number>();
+        const parsed = parseEvents(logs as Log[], timestamps);
+        persistParsedEvents(
+          parsed.bids,
+          parsed.evictions,
+          parsed.configEvents,
+          head
+        );
+        logParsedBatch(parsed);
+      } else {
+        persistParsedEvents([], [], [], head);
       }
 
       lastProcessed = head;
