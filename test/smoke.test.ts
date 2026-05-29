@@ -25,6 +25,8 @@ import {
   closeDb,
   getBidCount,
   getEvictionCount,
+  recordBidAction,
+  getSpendWeiSince,
   type ParsedBid,
   type ParsedEviction,
 } from "../src/db/store";
@@ -234,6 +236,16 @@ test("getCurrentlyCached handles bid, evict, and rebid scenarios", () => {
   assert.equal(dup.bidsInserted, 0);
   assert.equal(dup.bidsSkipped, 1);
   assert.equal(getBidCount(), 4, "bid count unchanged after replay");
+});
+
+test("getSpendWeiSince counts dry-run rows only when asked (NEW-6 preview)", () => {
+  const ch = ("0x" + "e5".repeat(32)) as `0x${string}`;
+  recordBidAction({ codehash: ch, program: null, bidWei: "1000", status: "submitted", txHash: null, reason: "live" });
+  recordBidAction({ codehash: ch, program: null, bidWei: "500", status: "dry-run", txHash: null, reason: "sim" });
+
+  const live = getSpendWeiSince(0);
+  const withDry = getSpendWeiSince(0, { includeDryRun: true });
+  assert.equal(withDry - live, 500n, "dry-run row only counted when includeDryRun is set");
 });
 
 test.after(() => {

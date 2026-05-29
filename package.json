@@ -1,8 +1,11 @@
 {
   "name": "stylus-cache-sentinel",
   "version": "0.1.0",
-  "description": "Indexer for Arbitrum Stylus CacheManager bids and evictions",
+  "description": "Indexer + automation CLI for Arbitrum Stylus CacheManager bids and evictions",
   "main": "dist/index.js",
+  "bin": {
+    "sentinel": "dist/index.js"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
@@ -10,7 +13,8 @@
     "sync": "ts-node src/index.ts sync",
     "status": "ts-node src/index.ts status",
     "reconcile": "ts-node src/index.ts reconcile",
-    "test": "TS_NODE_PROJECT=tsconfig.test.json node --test --require ts-node/register test/smoke.test.ts"
+    "run-sentinel": "ts-node src/index.ts run",
+    "test": "TS_NODE_PROJECT=tsconfig.test.json node --test --require ts-node/register test/*.test.ts"
   },
   "dependencies": {
     "viem": "^2.21.0",

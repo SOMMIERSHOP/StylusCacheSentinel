@@ -89,6 +89,23 @@ export function initSchema(db: Database.Database): void {
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    -- Audit log of bid decisions/submissions made by the sentinel (M4).
+    -- Additive table: created on any open, so it appears for v2 DBs from M1/M2
+    -- without forcing a schema-version bump / table drop.
+    CREATE TABLE IF NOT EXISTS bid_actions (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      codehash     BLOB    NOT NULL,
+      program      BLOB,
+      bid_wei      TEXT    NOT NULL,
+      status       TEXT    NOT NULL,   -- dry-run | blocked | submitted | confirmed | failed
+      tx_hash      BLOB,
+      reason       TEXT,
+      created_at   INTEGER NOT NULL,
+      confirmed_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_bid_actions_created ON bid_actions(created_at);
+    CREATE INDEX IF NOT EXISTS idx_bid_actions_status  ON bid_actions(status);
   `);
 
   db.prepare(

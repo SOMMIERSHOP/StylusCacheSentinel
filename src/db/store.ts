@@ -399,6 +399,170 @@ export function getCurrentlyCached(): CachedEntry[] {
   return rows.map((r) => ({ codehash: bufToHex(r.codehash), size: r.size }));
 }
 
+// Resolve the most recently seen codehash for a program address from the
+// indexed bid history. Returns null if we've never observed a bid for it.
+export function getCodehashForProgram(
+  program: `0x${string}`
+): `0x${string}` | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT c.codehash AS codehash
+         FROM codehashes c
+         JOIN programs p ON p.id = c.program_id
+        WHERE p.address = ?
+        ORDER BY c.first_seen_block DESC
+        LIMIT 1`
+    )
+    .get(hexToBuf(program)) as { codehash: Buffer } | undefined;
+  return row ? bufToHex(row.codehash) : null;
+}
+
+// Resolve the program address last associated with a codehash, if known.
+export function getProgramForCodehash(
+  codehash: `0x${string}`
+): `0x${string}` | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT p.address AS address
+         FROM codehashes c
+         JOIN programs p ON p.id = c.program_id
+        WHERE c.codehash = ?
+        LIMIT 1`
+    )
+    .get(hexToBuf(codehash)) as { address: Buffer } | undefined;
+  return row ? bufToHex(row.address) : null;
+}
+
+// bid_actions — audit trail of sentinel bid decisions (M4)
+
+export type BidActionStatus =
+  | "dry-run"
+  | "blocked"
+  | "submitted"
+  | "confirmed"
+  | "failed";
+
+export interface BidActionInput {
+  codehash: `0x${string}`;
+  program: `0x${string}` | null;
+  bidWei: string;
+  status: BidActionStatus;
+  txHash: `0x${string}` | null;
+  reason: string;
+}
+
+export function recordBidAction(action: BidActionInput): number {
+  const db = getDb();
+  const info = db
+    .prepare(
+      `INSERT INTO bid_actions
+         (codehash, program, bid_wei, status, tx_hash, reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      hexToBuf(action.codehash),
+      action.program ? hexToBuf(action.program) : null,
+      action.bidWei,
+      action.status,
+      action.txHash ? hexToBuf(action.txHash) : null,
+      action.reason,
+      Math.floor(Date.now() / 1000)
+    );
+  return Number(info.lastInsertRowid);
+}
+
+export function updateBidAction(
+  id: number,
+  patch: { status?: BidActionStatus; txHash?: `0x${string}` | null; confirmedAt?: number }
+): void {
+  const db = getDb();
+  const sets: string[] = [];
+  const params: (string | number | Buffer | null)[] = [];
+  if (patch.status !== undefined) {
+    sets.push("status = ?");
+    params.push(patch.status);
+  }
+  if (patch.txHash !== undefined) {
+    sets.push("tx_hash = ?");
+    params.push(patch.txHash ? hexToBuf(patch.txHash) : null);
+  }
+  if (patch.confirmedAt !== undefined) {
+    sets.push("confirmed_at = ?");
+    params.push(patch.confirmedAt);
+  }
+  if (sets.length === 0) return;
+  params.push(id);
+  db.prepare(`UPDATE bid_actions SET ${sets.join(", ")} WHERE id = ?`).run(
+    ...params
+  );
+}
+
+// Sum of wei committed since a unix timestamp. Used by the per-window spend
+// cap. Counts submitted/confirmed bids; pass includeDryRun to also count
+// dry-run rows, so a dry-run loop can preview whether live mode would hit the
+// cap. Summed in BigInt to avoid float loss.
+export function getSpendWeiSince(
+  sinceUnix: number,
+  opts: { includeDryRun?: boolean } = {}
+): bigint {
+  const db = getDb();
+  const statuses = opts.includeDryRun
+    ? "('submitted','confirmed','dry-run')"
+    : "('submitted','confirmed')";
+  const rows = db
+    .prepare(
+      `SELECT bid_wei FROM bid_actions
+        WHERE created_at >= ? AND status IN ${statuses}`
+    )
+    .all(sinceUnix) as { bid_wei: string }[];
+  return rows.reduce((acc, r) => acc + BigInt(r.bid_wei), 0n);
+}
+
+export interface BidActionRow {
+  id: number;
+  codehash: `0x${string}`;
+  program: `0x${string}` | null;
+  bid_wei: string;
+  status: BidActionStatus;
+  tx_hash: `0x${string}` | null;
+  reason: string | null;
+  created_at: number;
+  confirmed_at: number | null;
+}
+
+export function listRecentBidActions(limit = 20): BidActionRow[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT id, codehash, program, bid_wei, status, tx_hash, reason, created_at, confirmed_at
+         FROM bid_actions ORDER BY created_at DESC, id DESC LIMIT ?`
+    )
+    .all(limit) as {
+    id: number;
+    codehash: Buffer;
+    program: Buffer | null;
+    bid_wei: string;
+    status: BidActionStatus;
+    tx_hash: Buffer | null;
+    reason: string | null;
+    created_at: number;
+    confirmed_at: number | null;
+  }[];
+  return rows.map((r) => ({
+    id: r.id,
+    codehash: bufToHex(r.codehash),
+    program: r.program ? bufToHex(r.program) : null,
+    bid_wei: r.bid_wei,
+    status: r.status,
+    tx_hash: r.tx_hash ? bufToHex(r.tx_hash) : null,
+    reason: r.reason,
+    created_at: r.created_at,
+    confirmed_at: r.confirmed_at,
+  }));
+}
+
 export interface LatestConfigEvents {
   cacheSize: string | null;
   decay: string | null;

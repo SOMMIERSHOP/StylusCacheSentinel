@@ -1,7 +1,13 @@
 node_modules/
 dist/
 .env
+.env.local
+.env*.local
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-journal
 *.log
 .DS_Store

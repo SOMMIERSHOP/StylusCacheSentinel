@@ -43,7 +43,7 @@ milestone ships something independently useful:
 
 ---
 
-As of the latest commit on `main`, the project ships **Milestones 1 and 2**.
+As of the latest commit on `main`, the project ships **Milestones 1 through 4**.
 
 ### Indexer (M1)
 
@@ -82,11 +82,62 @@ As of the latest commit on `main`, the project ships **Milestones 1 and 2**.
 - **Smoke tests** — `node:test` suite covering `parseEvents` and the
   bid / evict / rebid derivation logic in `getCurrentlyCached`.
 
-### Not yet implemented (M3+)
+### CLI (M3)
 
-No wallet integration, no cross-platform packaged CLI binary, no automatic
-bid submission, no multi-contract management loop, no alerting. Those are
-scoped for M3 and M4. See the [Roadmap](#roadmap).
+- **Subcommand CLI** (`sentinel <command>`) with a zero-dependency flag parser
+  (`--key value`, `--key=value`, `--flag`); exposed as a `sentinel` bin so it
+  runs the same on Linux / macOS / Windows (Node 20+).
+- **User config** at `~/.sentinel/config.json` (`SENTINEL_HOME` overridable):
+  `config init` / `show` / `set <key> <value>` / `path`. Every value is
+  type-checked and validated on write *and* on load, so a malformed config is
+  rejected rather than silently misapplied.
+- **Watchlist** of programs/codehashes to keep cached, with per-target bid
+  ceiling and headroom overrides: `watch add|remove|list`.
+- **Wallet** via `SENTINEL_PRIVATE_KEY` (env-only signing model): `wallet
+  address` / `wallet balance`.
+- **Inspection & manual ops**: `inspect <target>` (cache status, min bid,
+  current bid, size) and `bid <target> [--amount <eth>] [--yes]` (dry-run
+  unless `--yes`).
+
+### Sentinel automation (M4)
+
+- **`sentinel run`** — the autonomous monitoring + bidding loop over the whole
+  watchlist. Each tick reads `codehashIsCached`, `getMinBid`, and the live
+  cache state, then decides per target whether to (re)bid.
+- **Bid decision engine** — bid when a target is not cached; proactively rebid
+  when our margin over the eviction floor decays below the configured headroom;
+  do nothing while there's free cache space. The core math is a pure,
+  unit-tested function.
+- **Fail-safes**, applied in order: a monitor-only guard (a target known only
+  by codehash, with no recoverable program address, is never submitted — see
+  below), a per-bid ceiling, a per-window spend cap (`maxSpendPerWindowEth` /
+  `spendWindowHours`), a per-target **cooldown** (`bidCooldownSeconds`) that
+  prevents re-bidding / dry-run row spam every tick, **dry-run by default**
+  (`--live` opts in to spending), and optional `haltOnDrift` (refuse to bid
+  while reconcile reports DB-vs-chain drift).
+- **Correct bid accounting** — `CacheManager` stores bids in a decay-inflated
+  space (`msg.value + block.timestamp * decay`) while `getMinBid` returns plain
+  `msg.value`; the decision normalizes both to `msg.value` space before
+  comparing, and only treats a target as at-risk when the cache is actually
+  full (otherwise nothing can evict it). `getMinBid` returns the *largest* bid
+  in the set that must be evicted (not the sum), so one bid clears a
+  multi-eviction; a lost read→land race just reverts `BidTooSmall` and is
+  retried, never an overpay.
+- **Read batching** — when Multicall3 is present on the chain (Arbitrum
+  One/Nova) the per-tick reads are batched into a single call; chains without
+  it (some Orbit chains) fall back to bounded-concurrency chunked reads.
+- **Multi-contract** management from one process; **graceful shutdown** on
+  SIGINT/SIGTERM.
+- **Audit trail** — every decision/submission is logged to a `bid_actions`
+  table (`sentinel history`), which also backs the spend cap.
+- **Robust revert handling** — Stylus custom errors (`ProgramExpired`,
+  `ProgramNotActivated`, …) are decoded and reported (e.g. "needs
+  re-activation") instead of crashing the loop.
+
+### Not yet implemented (M5+)
+
+Full documentation set (M5) and mainnet hardening / production onboarding
+toward the 50-contract target (M6). See the [Roadmap](#roadmap).
 
 ---
 
@@ -255,7 +306,13 @@ cp .env.example .env
 # edit .env:
 #   ARB_RPC_URL=https://arb1.arbitrum.io/rpc
 #   DB_PATH=./sentinel.db
+#   SENTINEL_PRIVATE_KEY=0x...   # only needed for `run --live` / `bid --yes`
 ```
+
+The automation layer keeps its own config under `~/.sentinel/config.json`
+(override the directory with `SENTINEL_HOME`). The signing key is read only
+from the `SENTINEL_PRIVATE_KEY` environment variable and is never written to
+disk by the tool.
 
 ### Run
 
@@ -273,6 +330,27 @@ npm run reconcile
 npm test
 ```
 
+### Drive the automation layer
+
+```bash
+# one-time: create the config and add something to watch
+sentinel config init
+sentinel watch add 0xYourStylusProgramAddress --max-bid 0.01 --headroom 25
+
+# see what one target looks like on-chain
+sentinel inspect 0xYourStylusProgramAddress
+
+# run the loop — dry-run first (no wallet, no spend)
+sentinel run --once
+sentinel run                 # continuous dry-run
+
+# go live (needs SENTINEL_PRIVATE_KEY + funded account)
+sentinel run --live
+```
+
+In dev (without building) substitute `ts-node src/index.ts` for `sentinel`,
+or use the npm scripts (`npm run sync`, `npm run run-sentinel`, …).
+
 ---
 
 ## Commands
@@ -282,6 +360,19 @@ npm test
 | `sentinel sync`          | Resumes backfill from the last checkpoint, then switches to a live tail. Safe to stop and restart.                        |
 | `sentinel status`        | Pretty-prints live `CacheManager` state: total cache size, used, free, decay rate, paused flag.                          |
 | `sentinel reconcile`     | Computes the DB-derived currently-cached set and total size, compares against `getEntries()` / `queueSize()`, prints drift and any sync gaps. Exits 0 on match, 1 on drift. |
+| `sentinel config <init\|show\|set\|path>` | Manage the validated user config at `~/.sentinel/config.json`.                                              |
+| `sentinel watch <add\|remove\|list>`      | Manage the watchlist of programs/codehashes to keep cached.                                                |
+| `sentinel wallet <address\|balance>`      | Show the active signer (from `SENTINEL_PRIVATE_KEY`) and its ETH balance.                                  |
+| `sentinel inspect <target>`               | Cache status, min bid, current bid, and size for one program/codehash.                                     |
+| `sentinel bid <target> [--amount <eth>] [--yes]` | Manually place a bid. Dry-run unless `--yes`.                                                        |
+| `sentinel history [--limit <n>]`          | Recent bid decisions/submissions from the audit log.                                                       |
+| `sentinel run [--live] [--once]`          | Autonomous monitoring + bidding loop over the watchlist. **Dry-run unless `--live`.**                       |
+
+`<target>` is a program address (20-byte hex) or a codehash (32-byte hex). A
+program is resolved to its codehash from the indexer DB first, then from
+on-chain account code. **Bidding requires a program address** — `placeBid` is
+keyed on the address, so a target known only by codehash is monitor-only until
+the indexer can map it back to a program (run `sentinel sync`).
 
 ---
 
@@ -291,8 +382,8 @@ npm test
 | --------- | -------------------------------------------------------- | ------------------------------ |
 | M1        | Indexer core + local DB                                  | **Shipped**                    |
 | M2        | Data transformation + schema enhancement + integrity     | **Shipped**                    |
-| M3        | CLI (wallet, config, cross-platform packaging)           | Planned                        |
-| M4        | Sentinel monitoring / automated bidding                  | Planned                        |
+| M3        | CLI (wallet, config, cross-platform packaging)           | **Shipped**                    |
+| M4        | Sentinel monitoring / automated bidding                  | **Shipped**                    |
 | M5        | Full documentation                                       | Partial (this README)          |
 | M6        | Mainnet deployment + 50-contract production target       | Planned                        |
 
@@ -334,6 +425,12 @@ onboarding toward the grant KPI of 50 cached contracts.
 | Data latency (M1)                                                       | < 15 s               | Bounded by `pollIntervalMs` (default 4 s) plus one `getLogs` round-trip.                |
 | Schema efficiency (M2)                                                  | ≥ 30% vs v1          | BLOB + FK normalization removes ~60% of per-row bytes in `bids`.                        |
 | Data integrity (M2)                                                     | Zero loss            | `UNIQUE(tx_hash, log_index)` + transactional writes + `sync_gaps` + reconcile command.  |
+| Command coverage (M3)                                                   | 100% of services     | Every service (indexer, config, watchlist, wallet, inspect, manual bid, sentinel) has a command. |
+| Command response time (M3)                                              | < 10 s               | Local commands are instant; chain reads are 1–3 RPC round-trips.                        |
+| Configuration accuracy (M3)                                             | 100% validated       | Config is type-checked + validated on every write *and* load; invalid values are rejected. |
+| Sentinel startup (M4)                                                   | < 20 s               | Resolve manager + load config + resolve targets; ~0.2 s in practice (logged each run).  |
+| Cache-expiration detection (M4)                                         | < 10 s               | Bounded by `pollIntervalMs` (default 5 s) plus the per-tick reads.                       |
+| Bid execution (M4)                                                      | < 55 s               | `placeBid` + `waitForTransactionReceipt`; Arbitrum confirms in ~1–2 s under normal load. |
 
 ---
 
@@ -341,10 +438,12 @@ onboarding toward the grant KPI of 50 cached contracts.
 
 ```
 src/
-  abi.ts                  ABI slices (ArbWasmCache + CacheManager)
+  abi.ts                  ABI slices (ArbWasmCache + CacheManager + write ABI + errors)
   config.ts               env loading
   provider.ts             viem PublicClient
   resolver.ts             active CacheManager lookup
+  wallet.ts               SENTINEL_PRIVATE_KEY signer + wallet client (M3)
+  codehash.ts             target classification + program→codehash resolution
   types.ts                shared types
   indexer/
     backfill.ts           historical paged scan, resumable
@@ -352,13 +451,22 @@ src/
     format.ts             parseEvents + pretty-printer
     state.ts              live on-chain state reader
     reconcile.ts          DB-vs-chain drift report
+  cli/
+    args.ts               zero-dep flag parser
+    userConfig.ts         ~/.sentinel/config.json load/save/validate (M3)
+  sentinel/
+    assess.ts             pure bid-decision math + per-target assessment (M4)
+    bidder.ts             placeBid submission + fail-safes + audit (M4)
+    run.ts                the autonomous monitoring/bidding loop (M4)
   db/
-    schema.ts             v2 schema + v1 auto-drop
-    store.ts              connection + upserts + persist + queries
-  index.ts                CLI entry (sync / status / reconcile)
+    schema.ts             v2 schema + v1 auto-drop + bid_actions audit table
+    store.ts              connection + upserts + persist + queries + bid audit
+  index.ts                CLI entry / command router
 
 test/
   smoke.test.ts           parseEvents + getCurrentlyCached coverage
+  cli.test.ts             config validation + target classification (M3)
+  sentinel.test.ts        bid-decision math (M4)
 
 tsconfig.json             prod build (rootDir = src/)
 tsconfig.test.json        test type-check (includes test/)
