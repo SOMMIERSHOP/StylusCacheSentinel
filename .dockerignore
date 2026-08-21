@@ -1,0 +1,31 @@
+# Keep the build context small, and keep secrets and host-built artifacts out
+# of the image entirely.
+
+# Secrets — SENTINEL_PRIVATE_KEY must reach the container at run time, never be
+# baked into a layer.
+.env
+.env.*
+!.env.example
+
+# Host-built artifacts. node_modules in particular must never be copied in:
+# better-sqlite3's native addon is compiled for the host's Node ABI and would
+# not load inside the image.
+node_modules
+dist
+
+# Local indexer state — the container writes its own under /data.
+*.db
+*.db-wal
+*.db-shm
+
+.git
+.github
+.gitignore
+
+# Not needed at build or run time.
+test
+scripts
+docs
+*.md
+!README.md
+.DS_Store

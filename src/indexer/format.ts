@@ -1,3 +1,14 @@
+/**
+ * Decodes raw CacheManager logs into typed, persistence-ready rows.
+ *
+ * Sits between the RPC layer (backfill/tail, which fetch raw logs) and the
+ * DB layer (`db/store`, which persists them): this module is a pure,
+ * side-effect-free translation step, plus a console pretty-printer used by
+ * the live tail for human-readable output.
+ *
+ * @module
+ */
+
 import { parseEventLogs, type Log, type PublicClient } from "viem";
 import { cacheManagerAbi } from "../abi";
 import type {
@@ -7,6 +18,7 @@ import type {
 } from "../db/store";
 import chalk from "chalk";
 
+/** Result of decoding a batch of raw logs, grouped by row type ready for `persistParsedEvents`. */
 export interface ParsedBatch {
   bids: ParsedBid[];
   evictions: ParsedEviction[];
@@ -14,6 +26,20 @@ export interface ParsedBatch {
 }
 
 // pure parser — produces row arrays ready for persistence
+/**
+ * Decodes a batch of raw CacheManager logs into typed rows grouped by
+ * event kind (bids, evictions, config changes).
+ *
+ * Pure function: performs no I/O and has no side effects, so it can be
+ * called for both historical backfill batches and live tail ticks. Logs
+ * without a `transactionHash`/`logIndex` (i.e. not yet mined) are silently
+ * skipped, as are event types outside the recognized CacheManager ABI
+ * events.
+ *
+ * @param logs - raw logs fetched from the RPC provider for the CacheManager address
+ * @param timestamps - block number -> unix timestamp lookup (see `getBlockTimestamps`); missing entries default to 0
+ * @returns rows grouped into bids, evictions, and config events, ready for `persistParsedEvents`
+ */
 export function parseEvents(
   logs: Log[],
   timestamps: Map<number, number>
@@ -107,6 +133,13 @@ export function parseEvents(
 }
 
 // pretty-print a parsed batch (used by the live tail for visibility)
+/**
+ * Pretty-prints a parsed batch to the console in block order, color-coded
+ * by event kind. Used by the live tail to give operators real-time
+ * visibility into indexed activity; has no effect on persisted state.
+ *
+ * @param batch - decoded events to render, as produced by `parseEvents`
+ */
 export function logParsedBatch(batch: ParsedBatch): void {
   const all: { block: number; render: () => void }[] = [];
 
@@ -169,6 +202,14 @@ export function logParsedBatch(batch: ParsedBatch): void {
 }
 
 // bulk-fetch timestamps, dedupes block numbers first
+/**
+ * Fetches unix timestamps for a set of block numbers, deduplicating first
+ * and fetching in small chunks to avoid overwhelming the RPC provider.
+ *
+ * @param blockNumbers - block numbers to look up (may contain duplicates, e.g. one per log in a batch)
+ * @param client - viem public client used to fetch blocks
+ * @returns map of block number to unix timestamp (seconds), covering every unique input block
+ */
 export async function getBlockTimestamps(
   blockNumbers: number[],
   client: PublicClient

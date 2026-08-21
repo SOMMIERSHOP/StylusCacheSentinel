@@ -27,6 +27,7 @@ import {
   getEvictionCount,
   recordBidAction,
   getSpendWeiSince,
+  getLastBidActionAtMs,
   type ParsedBid,
   type ParsedEviction,
 } from "../src/db/store";
@@ -255,4 +256,49 @@ test.after(() => {
       fs.unlinkSync(tmpDb + ext);
     } catch {}
   }
+});
+
+// The cooldown is what stops the loop re-bidding a target whose previous bid is
+// still propagating. It used to live in an in-memory Map, which a restart wiped
+// — and the watchdog makes restarts a designed event, not just a crash. Reading
+// it back from the audit trail is what makes it survive.
+test("bid-action cooldown is recoverable after a restart", () => {
+  const codehash = ("0x" + "e1".repeat(32)) as `0x${string}`;
+  const program = ("0x" + "e2".repeat(20)) as `0x${string}`;
+
+  assert.equal(
+    getLastBidActionAtMs(codehash),
+    null,
+    "a target never acted on has no cooldown"
+  );
+
+  const before = Date.now();
+  recordBidAction({
+    codehash,
+    program,
+    bidWei: "1000",
+    status: "submitted",
+    txHash: ("0x" + "ab".repeat(32)) as `0x${string}`,
+    reason: "cooldown test",
+  });
+
+  const at = getLastBidActionAtMs(codehash);
+  assert.ok(at !== null, "an acted-on target must report a last-action time");
+
+  // created_at is stored in whole seconds, so allow for the truncation.
+  assert.ok(
+    at! <= Date.now() && at! >= before - 1_000,
+    `last-action time ${at} should be around now (${before})`
+  );
+
+  // Simulate the restart: drop the connection and reopen from the same file.
+  closeDb();
+  assert.equal(
+    getLastBidActionAtMs(codehash),
+    at,
+    "cooldown must survive the process restart the watchdog can cause"
+  );
+
+  // An unrelated target is unaffected.
+  assert.equal(getLastBidActionAtMs(("0x" + "ff".repeat(32)) as `0x${string}`), null);
 });

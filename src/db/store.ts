@@ -1,9 +1,30 @@
+/**
+ * Local SQLite persistence layer: connection lifecycle, hex/BLOB helpers, sync
+ * bookkeeping, idempotent event writes, analytics queries, and bid_actions audit trail.
+ *
+ * Every exported query/write function lazily obtains the single shared connection via
+ * getDb(). Fact-table writes are idempotent through UNIQUE(tx_hash, log_index), and
+ * persistParsedEvents wraps all writes for one batch in a single transaction so a
+ * partial failure never leaves bids/evictions/config_events/sync_meta inconsistent.
+ *
+ * @module
+ */
+
 import Database from "better-sqlite3";
 import { config } from "../config";
 import { initSchema } from "./schema";
 
 let _db: Database.Database | null = null;
 
+/**
+ * Get the process-wide SQLite connection, opening and initializing it on first call.
+ *
+ * Sets WAL journaling, NORMAL synchronous mode, and enforces foreign keys, then runs
+ * initSchema (which may drop/recreate tables on a version mismatch). Subsequent calls
+ * return the cached connection.
+ *
+ * @returns The shared better-sqlite3 database handle.
+ */
 export function getDb(): Database.Database {
   if (!_db) {
     _db = new Database(config.dbPath);
@@ -15,6 +36,7 @@ export function getDb(): Database.Database {
   return _db;
 }
 
+/** Close the shared connection if open and clear the cached handle, so a subsequent getDb() reopens fresh. */
 export function closeDb(): void {
   if (_db) {
     _db.close();
@@ -22,16 +44,33 @@ export function closeDb(): void {
   }
 }
 
+/**
+ * Convert a `0x`-prefixed (or bare) hex string to a Buffer for BLOB storage.
+ *
+ * @param hex - Hex string, with or without `0x` prefix.
+ * @returns Raw bytes.
+ */
 export function hexToBuf(hex: string): Buffer {
   return Buffer.from(hex.startsWith("0x") ? hex.slice(2) : hex, "hex");
 }
 
+/**
+ * Convert a BLOB column's raw bytes back to a `0x`-prefixed hex string.
+ *
+ * @param buf - Bytes read from a BLOB column.
+ * @returns Lowercase `0x`-prefixed hex string.
+ */
 export function bufToHex(buf: Buffer | Uint8Array): `0x${string}` {
   return ("0x" + Buffer.from(buf).toString("hex")) as `0x${string}`;
 }
 
 // sync_meta
 
+/**
+ * Read the last block number the indexer fully synced through.
+ *
+ * @returns The stored block number, or null if nothing has been synced yet.
+ */
 export function getLastSyncedBlock(): number | null {
   const db = getDb();
   const row = db
@@ -40,6 +79,11 @@ export function getLastSyncedBlock(): number | null {
   return row ? parseInt(row.value, 10) : null;
 }
 
+/**
+ * Persist the last block number synced. Upserts the `last_block` key in sync_meta.
+ *
+ * @param block - Block number to record as fully synced.
+ */
 export function setLastSyncedBlock(block: number): void {
   const db = getDb();
   db.prepare(
@@ -47,6 +91,13 @@ export function setLastSyncedBlock(block: number): void {
   ).run("last_block", block.toString());
 }
 
+/**
+ * Upsert an arbitrary key/value pair in sync_meta, for indexer bookkeeping beyond
+ * `last_block` (e.g. gap-detection cursors).
+ *
+ * @param key - Meta key to set.
+ * @param value - Value to store (always TEXT).
+ */
 export function setSyncMeta(key: string, value: string): void {
   const db = getDb();
   db.prepare(
@@ -54,6 +105,12 @@ export function setSyncMeta(key: string, value: string): void {
   ).run(key, value);
 }
 
+/**
+ * Read an arbitrary sync_meta value by key.
+ *
+ * @param key - Meta key to read.
+ * @returns The stored value, or null if unset.
+ */
 export function getSyncMeta(key: string): string | null {
   const db = getDb();
   const row = db
@@ -64,6 +121,7 @@ export function getSyncMeta(key: string): string | null {
 
 // parsed row shapes — produced by format.ts, consumed here
 
+/** Decoded InsertBid event, ready to persist. */
 export interface ParsedBid {
   codehash: `0x${string}`;
   program: `0x${string}`;
@@ -75,6 +133,7 @@ export interface ParsedBid {
   timestamp: number;
 }
 
+/** Decoded DeleteBid/eviction event, ready to persist. */
 export interface ParsedEviction {
   codehash: `0x${string}`;
   bidWei: string;
@@ -85,6 +144,7 @@ export interface ParsedEviction {
   timestamp: number;
 }
 
+/** Decoded CacheManager config-change event (cache size, decay rate, pause state), ready to persist. */
 export interface ParsedConfigEvent {
   eventType: "SetCacheSize" | "SetDecayRate" | "Pause" | "Unpause";
   value: string | null;
@@ -94,6 +154,7 @@ export interface ParsedConfigEvent {
   timestamp: number;
 }
 
+/** Per-table insert/skip counts returned by persistParsedEvents, for logging and backfill progress reporting. */
 export interface PersistResult {
   bidsInserted: number;
   bidsSkipped: number;
@@ -193,6 +254,24 @@ function upsertCodehash(
 
 // fact inserts — idempotent via UNIQUE(tx_hash, log_index)
 
+/**
+ * Persist a batch of decoded bid/eviction/config events, upserting their dim-table
+ * rows (programs, codehashes) along the way, and advance `last_block` in sync_meta.
+ *
+ * Idempotent: re-running with overlapping data (e.g. after a re-org or a rerun of
+ * backfill) is safe — fact rows are `INSERT OR IGNORE`d against
+ * UNIQUE(tx_hash, log_index), so already-seen events are counted as "skipped" rather
+ * than duplicated. The entire batch (dim upserts, fact inserts, sync_meta update) runs
+ * inside a single transaction, so a failure partway through leaves no partial state.
+ *
+ * @param bids - Decoded InsertBid events to persist.
+ * @param evictions - Decoded eviction events to persist.
+ * @param configEvents - Decoded config-change events to persist.
+ * @param lastBlockInBatch - Highest block number covered by this batch, written to
+ *   `sync_meta.last_block` if non-null; pass null to skip advancing the cursor (e.g.
+ *   for out-of-order or partial batches).
+ * @returns Insert/skip counts per table.
+ */
 export function persistParsedEvents(
   bids: ParsedBid[],
   evictions: ParsedEviction[],
@@ -301,6 +380,15 @@ export function persistParsedEvents(
   return result;
 }
 
+/**
+ * Record a block range that could not be fully synced (e.g. RPC gave up, provider
+ * gap), for later inspection/backfill. Deduped on the (from_block, to_block) primary
+ * key — recording the same range twice is a no-op.
+ *
+ * @param fromBlock - First block of the unsynced range.
+ * @param toBlock - Last block of the unsynced range.
+ * @param reason - Short human-readable explanation of why the gap occurred.
+ */
 export function recordSyncGap(
   fromBlock: number,
   toBlock: number,
@@ -313,6 +401,7 @@ export function recordSyncGap(
   ).run(fromBlock, toBlock, reason, Math.floor(Date.now() / 1000));
 }
 
+/** A recorded unsynced block range, as read back from sync_gaps. */
 export interface SyncGap {
   from_block: number;
   to_block: number;
@@ -320,6 +409,11 @@ export interface SyncGap {
   recorded_at: number;
 }
 
+/**
+ * List all recorded sync gaps, oldest range first.
+ *
+ * @returns All rows in sync_gaps ordered by from_block ascending.
+ */
 export function listSyncGaps(): SyncGap[] {
   const db = getDb();
   return db
@@ -331,18 +425,33 @@ export function listSyncGaps(): SyncGap[] {
 
 // analytics queries
 
+/**
+ * Count all indexed bids (all-time, no dedup beyond the fact table's own UNIQUE constraint).
+ *
+ * @returns Total row count in the bids table.
+ */
 export function getBidCount(): number {
   const db = getDb();
   const row = db.prepare("SELECT COUNT(*) as cnt FROM bids").get() as { cnt: number };
   return row.cnt;
 }
 
+/**
+ * Count all indexed evictions.
+ *
+ * @returns Total row count in the evictions table.
+ */
 export function getEvictionCount(): number {
   const db = getDb();
   const row = db.prepare("SELECT COUNT(*) as cnt FROM evictions").get() as { cnt: number };
   return row.cnt;
 }
 
+/**
+ * Count distinct programs ever observed in a bid.
+ *
+ * @returns Total row count in the programs dim table.
+ */
 export function getUniqueProgramCount(): number {
   const db = getDb();
   const row = db.prepare("SELECT COUNT(*) as cnt FROM programs").get() as { cnt: number };
@@ -351,11 +460,19 @@ export function getUniqueProgramCount(): number {
 
 // a codehash is currently cached if its latest bid is not yet followed by an eviction
 // at a later (block, log_index). Returns the set plus sizes for reconciliation.
+/** A codehash currently believed to be resident in the cache, with its size in bytes. */
 export interface CachedEntry {
   codehash: `0x${string}`;
   size: number;
 }
 
+/**
+ * Compute the set of codehashes currently cached, derived purely from indexed history:
+ * a codehash is "cached" if its most recent bid (by block_number, log_index) has no
+ * later eviction. Used to reconcile local state against the live on-chain cache.
+ *
+ * @returns Currently-cached codehashes with their sizes.
+ */
 export function getCurrentlyCached(): CachedEntry[] {
   const db = getDb();
   const rows = db
@@ -401,6 +518,12 @@ export function getCurrentlyCached(): CachedEntry[] {
 
 // Resolve the most recently seen codehash for a program address from the
 // indexed bid history. Returns null if we've never observed a bid for it.
+/**
+ * Resolve the most recently seen codehash for a program address from indexed history.
+ *
+ * @param program - Program (contract) address to look up.
+ * @returns The latest known codehash for this program, or null if never observed.
+ */
 export function getCodehashForProgram(
   program: `0x${string}`
 ): `0x${string}` | null {
@@ -419,6 +542,12 @@ export function getCodehashForProgram(
 }
 
 // Resolve the program address last associated with a codehash, if known.
+/**
+ * Resolve the program address last associated with a codehash, if known.
+ *
+ * @param codehash - Codehash to look up.
+ * @returns The associated program address, or null if the codehash has no linked program.
+ */
 export function getProgramForCodehash(
   codehash: `0x${string}`
 ): `0x${string}` | null {
@@ -437,6 +566,7 @@ export function getProgramForCodehash(
 
 // bid_actions — audit trail of sentinel bid decisions (M4)
 
+/** Lifecycle status of a sentinel bid decision, from initial evaluation through on-chain confirmation. */
 export type BidActionStatus =
   | "dry-run"
   | "blocked"
@@ -444,6 +574,7 @@ export type BidActionStatus =
   | "confirmed"
   | "failed";
 
+/** Fields required to record a new bid_actions row. */
 export interface BidActionInput {
   codehash: `0x${string}`;
   program: `0x${string}` | null;
@@ -453,6 +584,12 @@ export interface BidActionInput {
   reason: string;
 }
 
+/**
+ * Insert a new bid_actions audit row recording a sentinel bid decision.
+ *
+ * @param action - Decision details to record.
+ * @returns The new row's id (for later updateBidAction calls as the tx progresses).
+ */
 export function recordBidAction(action: BidActionInput): number {
   const db = getDb();
   const info = db
@@ -473,6 +610,14 @@ export function recordBidAction(action: BidActionInput): number {
   return Number(info.lastInsertRowid);
 }
 
+/**
+ * Patch an existing bid_actions row in place (e.g. status: submitted -> confirmed,
+ * attaching txHash/confirmedAt once known). Only the fields present in `patch` are
+ * updated; omitted fields are left untouched. No-op if `patch` is empty.
+ *
+ * @param id - Row id returned by recordBidAction.
+ * @param patch - Partial fields to update.
+ */
 export function updateBidAction(
   id: number,
   patch: { status?: BidActionStatus; txHash?: `0x${string}` | null; confirmedAt?: number }
@@ -503,6 +648,16 @@ export function updateBidAction(
 // cap. Counts submitted/confirmed bids; pass includeDryRun to also count
 // dry-run rows, so a dry-run loop can preview whether live mode would hit the
 // cap. Summed in BigInt to avoid float loss.
+/**
+ * Sum bid_wei across bid_actions created at or after `sinceUnix`, for enforcing the
+ * per-window spend cap.
+ *
+ * @param sinceUnix - Unix timestamp (seconds); rows created at or after this are included.
+ * @param opts.includeDryRun - When true, also counts `dry-run` rows (in addition to
+ *   `submitted`/`confirmed`), letting a dry-run loop preview whether live mode would
+ *   breach the cap. Defaults to counting only `submitted`/`confirmed`.
+ * @returns Total wei spent in the window, summed as BigInt to avoid float precision loss.
+ */
 export function getSpendWeiSince(
   sinceUnix: number,
   opts: { includeDryRun?: boolean } = {}
@@ -520,6 +675,36 @@ export function getSpendWeiSince(
   return rows.reduce((acc, r) => acc + BigInt(r.bid_wei), 0n);
 }
 
+/**
+ * When the sentinel last recorded any action for a codehash, in unix milliseconds.
+ *
+ * Backs the per-target cooldown. Reading it from the audit trail rather than from
+ * process memory is what lets the cooldown survive a restart — including the
+ * watchdog-initiated restarts that are a designed part of the run loop. Counts
+ * every status, matching the loop's rule that acting on a target at all starts
+ * its cooldown.
+ *
+ * Note the second-level resolution: `created_at` is stored in seconds, so the
+ * returned value is rounded down to the second. Cooldowns are minutes long, so
+ * this is immaterial.
+ *
+ * @param codehash - the target's codehash
+ * @returns unix milliseconds of the most recent action, or null if there has never been one
+ */
+export function getLastBidActionAtMs(codehash: `0x${string}`): number | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT created_at FROM bid_actions
+        WHERE codehash = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1`
+    )
+    .get(hexToBuf(codehash)) as { created_at: number } | undefined;
+  return row ? row.created_at * 1000 : null;
+}
+
+/** A bid_actions row as read back from the DB, with hex-decoded BLOB fields. */
 export interface BidActionRow {
   id: number;
   codehash: `0x${string}`;
@@ -532,6 +717,12 @@ export interface BidActionRow {
   confirmed_at: number | null;
 }
 
+/**
+ * List the most recent bid_actions rows, newest first.
+ *
+ * @param limit - Max rows to return. Defaults to 20.
+ * @returns Recent bid action rows ordered by created_at, id descending.
+ */
 export function listRecentBidActions(limit = 20): BidActionRow[] {
   const db = getDb();
   const rows = db
@@ -563,12 +754,21 @@ export function listRecentBidActions(limit = 20): BidActionRow[] {
   }));
 }
 
+/** Most recently indexed CacheManager config values, each independently latest by its own event type. */
 export interface LatestConfigEvents {
   cacheSize: string | null;
   decay: string | null;
   paused: boolean | null;
 }
 
+/**
+ * Derive the latest known CacheManager config state purely from indexed config_events
+ * (cache size, decay rate, pause/unpause), each resolved independently as the most
+ * recent event of its type. Distinct from readCacheState (types.ts / indexer/state.ts),
+ * which reads live on-chain state instead of the local DB.
+ *
+ * @returns Latest cache size, decay rate, and pause state, each null if never observed.
+ */
 export function getLatestConfigState(): LatestConfigEvents {
   const db = getDb();
   const latest = (type: string): string | null => {

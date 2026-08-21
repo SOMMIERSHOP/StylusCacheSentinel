@@ -14,7 +14,12 @@
     "status": "ts-node src/index.ts status",
     "reconcile": "ts-node src/index.ts reconcile",
     "run-sentinel": "ts-node src/index.ts run",
-    "test": "TS_NODE_PROJECT=tsconfig.test.json node --test --require ts-node/register test/*.test.ts"
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "test": "node --test --require ts-node/register test/smoke.test.ts test/cli.test.ts test/sentinel.test.ts",
+    "test:e2e": "npm run build && node --test --require ts-node/register test/e2e/mainnet.test.ts",
+    "docs:coverage": "node scripts/doc-coverage.js",
+    "docs:readability": "node scripts/readability.js",
+    "docs:check": "npm run docs:coverage && npm run docs:readability"
   },
   "dependencies": {
     "viem": "^2.21.0",

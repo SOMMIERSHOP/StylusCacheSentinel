@@ -1,3 +1,14 @@
+/**
+ * Per-user configuration for the sentinel automation layer (M3).
+ *
+ * Stored as JSON under ~/.sentinel (override the home dir with SENTINEL_HOME,
+ * which the test suite uses for isolation). Everything here is validated
+ * before use so the CLI can guarantee "100% of configurations correctly
+ * applied" (M3 KPI).
+ *
+ * @module
+ */
+
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +19,7 @@ import { isAddress, isHex, parseEther } from "viem";
 // test suite uses for isolation). Everything here is validated before use so
 // the CLI can guarantee "100% of configurations correctly applied" (M3 KPI).
 
+/** Bid limits applied per target: a hard ceiling and a target margin above the on-chain minimum. */
 export interface BidPolicy {
   // Hard ceiling for a single bid, in ETH (string to preserve precision).
   maxBidEth: string;
@@ -15,6 +27,7 @@ export interface BidPolicy {
   headroomPercent: number;
 }
 
+/** One watchlist entry: a program or codehash to monitor, with optional per-target policy overrides. */
 export interface WatchTarget {
   // Exactly one of program / codehash is set, plus optional overrides.
   program?: `0x${string}`;
@@ -24,6 +37,7 @@ export interface WatchTarget {
   headroomPercent?: number;
 }
 
+/** The full shape of ~/.sentinel/config.json. */
 export interface UserConfig {
   // Optional RPC override; falls back to ARB_RPC_URL / default when unset.
   rpcUrl?: string;
@@ -44,8 +58,10 @@ export interface UserConfig {
 // Sanity ceiling for headroom — a percentage over the min bid. Bounded so a
 // fat-fingered `config set ... 100000` can't slip past validation (the per-bid
 // cap is the only other guard).
+/** Upper bound accepted for any `headroomPercent` value, to reject fat-fingered input. */
 export const MAX_HEADROOM_PERCENT = 10_000;
 
+/** The config written by `sentinel config init` and merged under any partial saved config on load. */
 export const DEFAULT_CONFIG: UserConfig = {
   pollIntervalMs: 5000,
   defaultPolicy: { maxBidEth: "0.01", headroomPercent: 20 },
@@ -56,14 +72,30 @@ export const DEFAULT_CONFIG: UserConfig = {
   watchlist: [],
 };
 
+/**
+ * Directory holding the sentinel's config and DB. Defaults to ~/.sentinel;
+ * override with SENTINEL_HOME (used by the test suite for isolation).
+ *
+ * @returns absolute path to the sentinel home directory
+ */
 export function sentinelHome(): string {
   return process.env.SENTINEL_HOME || path.join(os.homedir(), ".sentinel");
 }
 
+/**
+ * Path to the config JSON file within {@link sentinelHome}.
+ *
+ * @returns absolute path to config.json
+ */
 export function configPath(): string {
   return path.join(sentinelHome(), "config.json");
 }
 
+/**
+ * Whether a config file has been written yet.
+ *
+ * @returns true if config.json exists at {@link configPath}
+ */
 export function configExists(): boolean {
   return fs.existsSync(configPath());
 }
@@ -72,6 +104,13 @@ export function configExists(): boolean {
 // running full validation — used at CLI startup to point the clients at a
 // custom endpoint (e.g. an Orbit chain). Never throws: a missing/corrupt
 // config or an invalid scheme simply yields null (env/default is used).
+/**
+ * Read just the `rpcUrl` override from the config file, without running full
+ * validation. Used at CLI startup (before a client exists) to point the
+ * clients at a custom endpoint (e.g. an Orbit chain).
+ *
+ * @returns the configured RPC URL if present and well-formed, otherwise `null` — never throws
+ */
 export function readConfigRpcUrl(): string | null {
   try {
     if (!configExists()) return null;
@@ -84,6 +123,15 @@ export function readConfigRpcUrl(): string | null {
   return null;
 }
 
+/**
+ * Load, merge, and validate the user config from disk.
+ *
+ * Merges the saved JSON over {@link DEFAULT_CONFIG} so older config files
+ * still load correctly as new fields are added.
+ *
+ * @returns the validated, merged config
+ * @throws if no config file exists yet, or if the merged config fails {@link validateConfig}
+ */
 export function loadConfig(): UserConfig {
   const p = configPath();
   if (!fs.existsSync(p)) {
@@ -106,6 +154,12 @@ export function loadConfig(): UserConfig {
   return merged;
 }
 
+/**
+ * Validate and persist a config to disk, creating {@link sentinelHome} if needed.
+ *
+ * @param cfg — config to validate and write
+ * @throws if `cfg` fails {@link validateConfig} — invalid configs are never written
+ */
 export function saveConfig(cfg: UserConfig): void {
   const errors = validateConfig(cfg);
   if (errors.length > 0) {
@@ -116,6 +170,13 @@ export function saveConfig(cfg: UserConfig): void {
   fs.writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n");
 }
 
+/**
+ * Write a fresh {@link DEFAULT_CONFIG} to disk (`sentinel config init`).
+ *
+ * @param force — overwrite an existing config file instead of refusing (default false)
+ * @returns the newly written config
+ * @throws if a config already exists and `force` is not set
+ */
 export function initConfig(force = false): UserConfig {
   if (configExists() && !force) {
     throw new Error(
@@ -147,6 +208,13 @@ function isEthString(v: unknown): boolean {
   }
 }
 
+/**
+ * Validate a config object against all field constraints (types, ETH-string
+ * decimal format, positive-integer bounds, watchlist entry shape, etc).
+ *
+ * @param cfg — config to check
+ * @returns list of human-readable error messages; empty if valid
+ */
 export function validateConfig(cfg: UserConfig): string[] {
   const errors: string[] = [];
 
@@ -242,6 +310,18 @@ function validateTarget(t: WatchTarget, label: string): string[] {
 // ---- typed setters for `config set <key> <value>` -------------------------
 
 // Returns a parsed/validated copy with the dotted key applied, or throws.
+/**
+ * Apply `sentinel config set <key> <value>`: parse a raw string value for a
+ * (possibly dotted, e.g. `defaultPolicy.maxBidEth`) settable key and return a
+ * validated copy of the config with it applied. Does not mutate `cfg` or
+ * write to disk — callers persist the result via {@link saveConfig}.
+ *
+ * @param cfg — base config to copy and modify
+ * @param key — settable key name (see error message for the full list)
+ * @param rawValue — raw string value from the CLI, parsed per-key
+ * @returns a new, validated config with the key applied
+ * @throws if `key` is unknown, `rawValue` fails to parse for that key's type, or the resulting config fails {@link validateConfig}
+ */
 export function applyConfigSet(
   cfg: UserConfig,
   key: string,

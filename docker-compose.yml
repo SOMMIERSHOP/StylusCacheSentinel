@@ -1,0 +1,71 @@
+# Long-running Sentinel service.
+#
+#   docker compose run --rm sentinel config init
+#   docker compose run --rm sentinel watch add 0xYourProgram --max-bid 0.01
+#   docker compose up -d            # starts the loop in DRY-RUN
+#
+# Going live is a deliberate edit: uncomment the --live command below and
+# provide SENTINEL_PRIVATE_KEY. Until then this spends nothing.
+
+services:
+  sentinel:
+    build: .
+    image: stylus-cache-sentinel:latest
+    # Build locally; never try the registry. Without this, compose first
+    # attempts to pull `stylus-cache-sentinel:latest`, fails with a confusing
+    # "pull access denied" for what is a local-only image name, and only then
+    # falls back to building. Layer caching keeps the build cheap.
+    # To run a published image instead, set `image: ghcr.io/<owner>/<repo>:<tag>`
+    # and drop both `build:` and this line.
+    pull_policy: build
+    restart: unless-stopped
+
+    # Reaps zombies and forwards signals for the commands that do not install
+    # their own handlers. `run` and `sync` handle SIGTERM themselves.
+    init: true
+
+    environment:
+      # Compose substitutes these from your shell or a local .env file.
+      # The public endpoint rate-limits a full backfill — set a private RPC
+      # for anything beyond a trial.
+      - ARB_RPC_URL=${ARB_RPC_URL:-https://arb1.arbitrum.io/rpc}
+      # Empty by default, which leaves the signer unavailable and the tool
+      # unable to spend. Never commit a real key here.
+      - SENTINEL_PRIVATE_KEY=${SENTINEL_PRIVATE_KEY:-}
+
+    volumes:
+      # The SQLite index and user config. Without this, every recreate starts
+      # from an empty index and re-backfills from Stylus genesis.
+      - sentinel-data:/data
+
+    # The loop logs a line per target per tick — every 5 s by default. On the
+    # default json-file driver with no cap, that grows without bound and
+    # eventually fills the host disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # A runaway backfill or a pathological watchlist should hit a wall inside
+    # the container rather than take the host down with it. Raise these if you
+    # watch a large number of targets.
+    mem_limit: 512m
+    cpus: 1.0
+
+    # Inherited from the image; restated here so the operational contract is
+    # visible in the file people actually edit. `run` stamps a heartbeat each
+    # tick, and `health` fails once ticks stop.
+    healthcheck:
+      test: ["CMD", "node", "dist/index.js", "health"]
+      interval: 60s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+    # Dry-run: assesses every watchlist target and logs what it *would* bid.
+    command: ["run"]
+    # command: ["run", "--live"]   # spends real ETH — requires SENTINEL_PRIVATE_KEY
+
+volumes:
+  sentinel-data:

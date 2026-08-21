@@ -1,4 +1,14 @@
 #!/usr/bin/env node
+/**
+ * Stylus Cache Sentinel CLI — entry point and command router.
+ *
+ * Parses `argv`, dispatches to the `cmdXxx` handlers below (indexer commands
+ * from M1/M2, config/watchlist/wallet/inspect/bid from M3, the automation
+ * loop from M4), and applies a config-based RPC override before any client is
+ * constructed. Not a library — this module has no exports.
+ *
+ * @module
+ */
 import chalk from "chalk";
 import { formatEther, parseEther } from "viem";
 import { resolveCacheManager } from "./resolver";
@@ -6,10 +16,9 @@ import { readCacheState } from "./indexer/state";
 import { backfill } from "./indexer/backfill";
 import { startTail } from "./indexer/tail";
 import { reconcile, printReconcileReport } from "./indexer/reconcile";
-import { getClient, setRpcUrl } from "./provider";
+import { getClient, setRpcUrl, resolveChain } from "./provider";
 import { config } from "./config";
 import { cacheManagerAbi, cacheManagerWriteAbi, arbWasmCacheAbi } from "./abi";
-import { arbitrum } from "viem/chains";
 import { parseArgs, flagString, flagBool } from "./cli/args";
 import {
   initConfig,
@@ -25,6 +34,7 @@ import {
 import { classifyInput, resolveRawTarget } from "./codehash";
 import { recommendedBid, revertErrorName } from "./sentinel/assess";
 import { runSentinel } from "./sentinel/run";
+import { checkHealth, readHeartbeat } from "./sentinel/heartbeat";
 import {
   hasWallet,
   describeWallet,
@@ -39,6 +49,8 @@ const STYLUS_GENESIS_BLOCK = 245_000_000;
 
 // ---- M1/M2 commands (indexer) --------------------------------------------
 
+// `sync`: scan CacheManager history from the Stylus genesis block to the
+// current head, then switch to a live event tail. Ctrl-C aborts cleanly.
 async function cmdSync() {
   console.log(chalk.cyan("\n  Stylus Cache Sentinel — sync\n"));
 
@@ -76,9 +88,11 @@ async function cmdSync() {
   await startTail(cacheManager, lastProcessed, ac.signal);
 }
 
+// `status`: print current on-chain cache usage/decay/pause state.
 async function cmdStatus() {
   console.log(chalk.cyan("\n  Stylus Cache Sentinel — status\n"));
 
+  const chain = await resolveChain();
   const cacheManager = await resolveCacheManager();
   const state = await readCacheState(cacheManager);
 
@@ -89,6 +103,7 @@ async function cmdStatus() {
     1024
   ).toFixed(1);
 
+  console.log(chalk.white(`  Chain:         ${chain.name} (${chain.id})`));
   console.log(chalk.white(`  CacheManager:  ${state.cacheManagerAddress}`));
   console.log(chalk.white(`  Cache size:    ${totalKb} KB`));
   console.log(chalk.white(`  Used:          ${usedKb} KB`));
@@ -98,6 +113,8 @@ async function cmdStatus() {
   console.log();
 }
 
+// `reconcile`: compare DB-derived cache state against on-chain truth and
+// exit non-zero if they've drifted.
 async function cmdReconcile() {
   const cacheManager = await resolveCacheManager();
   const report = await reconcile(cacheManager);
@@ -107,6 +124,7 @@ async function cmdReconcile() {
 
 // ---- M3: config --------------------------------------------------------
 
+// `config <init|show|set|path>`: manage ~/.sentinel/config.json.
 function cmdConfig(sub: string, positionals: string[], flags: Record<string, string | boolean>) {
   switch (sub) {
     case "init": {
@@ -149,6 +167,7 @@ function cmdConfig(sub: string, positionals: string[], flags: Record<string, str
 
 // ---- M3: watchlist -----------------------------------------------------
 
+// `watch <add|remove|list>`: manage the config's target watchlist.
 function cmdWatch(sub: string, positionals: string[], flags: Record<string, string | boolean>) {
   switch (sub) {
     case "add": {
@@ -248,6 +267,8 @@ function cmdWatch(sub: string, positionals: string[], flags: Record<string, stri
 
 // ---- M3: wallet --------------------------------------------------------
 
+// `wallet <address|balance>`: show the SENTINEL_PRIVATE_KEY-derived signer's
+// address or ETH balance.
 async function cmdWallet(sub: string) {
   switch (sub) {
     case "address": {
@@ -269,6 +290,8 @@ async function cmdWallet(sub: string) {
 
 // ---- M3: inspect a single target --------------------------------------
 
+// `inspect <target>`: show cache status, min bid, and current bid/size for
+// one program or codehash.
 async function cmdInspect(positionals: string[]) {
   const raw = positionals[0];
   if (!raw) throw new Error("usage: sentinel inspect <program|codehash>");
@@ -328,6 +351,8 @@ async function cmdInspect(positionals: string[]) {
 
 // ---- M3: manual bid (explicit override) -------------------------------
 
+// `bid <target> [--amount <eth>] [--yes]`: manually place (or dry-run) a
+// CacheManager bid; records the action to the bid-action history table.
 async function cmdBid(positionals: string[], flags: Record<string, string | boolean>) {
   const raw = positionals[0];
   if (!raw) throw new Error("usage: sentinel bid <program|codehash> [--amount <eth>] [--yes]");
@@ -395,10 +420,10 @@ async function cmdBid(positionals: string[], flags: Record<string, string | bool
 
   if (!hasWallet()) throw new Error("SENTINEL_PRIVATE_KEY is not set");
 
-  const wallet = getWalletClient();
+  const wallet = await getWalletClient();
   const txHash = await wallet.writeContract({
     account: getAccount(),
-    chain: arbitrum,
+    chain: await resolveChain(),
     address: cacheManager,
     abi: cacheManagerWriteAbi,
     functionName: "placeBid",
@@ -427,6 +452,8 @@ async function cmdBid(positionals: string[], flags: Record<string, string | bool
 
 // ---- M4: the sentinel loop --------------------------------------------
 
+// `run [--live] [--once]`: start the M4 sentinel automation loop, which
+// monitors the watchlist and auto-bids. Dry-run unless --live is passed.
 async function cmdRun(flags: Record<string, string | boolean>) {
   // Dry-run is the default; --live opts in to spending real ETH.
   const live = flagBool(flags, "live");
@@ -443,8 +470,29 @@ async function cmdRun(flags: Record<string, string | boolean>) {
   await runSentinel({ dryRun, once, signal: ac.signal });
 }
 
+// ---- health ---------------------------------------------------------------
+
+// `health`: report whether the sentinel loop is still ticking, purely from the
+// heartbeat file. Exits 1 when wedged, which is what the container HEALTHCHECK
+// consumes. Touches neither the RPC nor the database on purpose — see
+// sentinel/heartbeat.ts.
+function cmdHealth(flags: Record<string, string | boolean>) {
+  const report = checkHealth(readHeartbeat());
+
+  if (flagBool(flags, "json")) {
+    console.log(JSON.stringify(report));
+  } else if (report.ok) {
+    console.log(chalk.green(`\n  healthy — ${report.reason}\n`));
+  } else {
+    console.log(chalk.red(`\n  unhealthy — ${report.reason}\n`));
+  }
+
+  if (!report.ok) process.exit(1);
+}
+
 // ---- history --------------------------------------------------------------
 
+// `history [--limit <n>]`: print recently recorded bid actions.
 function cmdHistory(flags: Record<string, string | boolean>) {
   const limit = Number(flagString(flags, "limit") ?? "20");
   const rows = listRecentBidActions(Number.isFinite(limit) ? limit : 20);
@@ -467,6 +515,8 @@ function cmdHistory(flags: Record<string, string | boolean>) {
 
 // ---- router ---------------------------------------------------------------
 
+// Print the top-level usage/help text (shown for no command, `help`, `-h`,
+// `--help`, or an unknown command).
 function printHelp() {
   console.log(`
   Stylus Cache Sentinel
@@ -498,11 +548,14 @@ function printHelp() {
 
   Sentinel automation (M4)
     run [--live] [--once]      monitor the watchlist & auto-bid (dry-run unless --live)
+    health [--json]            is the run loop still ticking? exits 1 if wedged
 
   <target> is a program address (20-byte hex) or a codehash (32-byte hex).
 `);
 }
 
+// Entry point: parse argv, apply any config RPC override, then dispatch to
+// the matching cmdXxx handler. Uncaught errors are printed and exit(1).
 async function main() {
   const [, , command, ...rest] = process.argv;
   const { positionals, flags } = parseArgs(rest);
@@ -540,6 +593,9 @@ async function main() {
         break;
       case "history":
         cmdHistory(flags);
+        break;
+      case "health":
+        cmdHealth(flags);
         break;
       case "run":
         await cmdRun(flags);

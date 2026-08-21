@@ -22,9 +22,12 @@ import {
   type UserConfig,
 } from "../src/cli/userConfig";
 import { classifyInput } from "../src/codehash";
+import { chainForId } from "../src/provider";
+import { arbitrum, arbitrumNova, arbitrumSepolia } from "viem/chains";
 
 const ADDR = ("0x" + "cd".repeat(20)) as `0x${string}`;
 const CODEHASH = ("0x" + "ab".repeat(32)) as `0x${string}`;
+const RPC = "https://example-orbit.invalid/rpc";
 
 test("classifyInput distinguishes program, codehash, and junk", () => {
   const a = classifyInput(ADDR);
@@ -110,6 +113,35 @@ test("bidCooldownSeconds is a positive integer", () => {
   assert.throws(() => applyConfigSet(cfg, "bidCooldownSeconds", "0"));
   const ok = applyConfigSet(cfg, "bidCooldownSeconds", "120");
   assert.equal(ok.bidCooldownSeconds, 120);
+});
+
+// --- chain resolution ------------------------------------------------------
+// The chain must follow whatever the RPC serves. Hardcoding Arbitrum One would
+// have every Nova/Orbit bid rejected on chain-id validation.
+
+test("chainForId returns viem's definition for known Arbitrum-family chains", () => {
+  assert.equal(chainForId(42161, RPC).id, 42161);
+  assert.equal(chainForId(42161, RPC).name, arbitrum.name);
+  assert.equal(chainForId(42170, RPC).name, arbitrumNova.name);
+  assert.equal(chainForId(421614, RPC).name, arbitrumSepolia.name);
+});
+
+test("chainForId synthesizes a usable chain for an unknown Orbit id", () => {
+  const orbit = chainForId(918_273, RPC);
+
+  assert.equal(orbit.id, 918_273, "must carry the id the RPC reported");
+  assert.equal(orbit.nativeCurrency.decimals, 18);
+  assert.equal(orbit.nativeCurrency.symbol, "ETH");
+  assert.deepEqual(orbit.rpcUrls.default.http, [RPC]);
+  // Multicall3 is deployed deterministically; provider still probes for code
+  // before enabling batching, so naming it here cannot break a chain without it.
+  assert.ok(orbit.contracts?.multicall3?.address);
+});
+
+test("chainForId does not confuse one Arbitrum chain for another", () => {
+  const ids = [42161, 42170, 421614, 918_273];
+  const resolved = ids.map((id) => chainForId(id, RPC).id);
+  assert.deepEqual(resolved, ids);
 });
 
 test.after(() => {

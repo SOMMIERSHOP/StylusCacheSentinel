@@ -1,10 +1,22 @@
+/**
+ * Drives the sentinel's poll loop: resolves watch targets, reads on-chain cache
+ * state once per tick, assesses each target, and executes bids for any that
+ * need one — with drift-halt, cooldown, and periodic re-resolution safety nets.
+ *
+ * This is the orchestration layer; the actual bid decision and execution
+ * logic live in ./assess and ./bidder respectively.
+ *
+ * @module
+ */
 import chalk from "chalk";
 import { parseEther, formatEther } from "viem";
 import { resolveCacheManager } from "../resolver";
 import { readCacheState } from "../indexer/state";
 import { reconcile } from "../indexer/reconcile";
 import { cacheManagerAbi } from "../abi";
-import { getClient, detectAndEnableMulticall } from "../provider";
+import { getClient, detectAndEnableMulticall, resolveChain } from "../provider";
+import { config } from "../config";
+import { getLastBidActionAtMs } from "../db/store";
 import { resolveTarget, type ResolvedTarget } from "../codehash";
 import { hasWallet, describeWallet } from "../wallet";
 import {
@@ -14,11 +26,13 @@ import {
 } from "../cli/userConfig";
 import { assessTarget, type TickContext } from "./assess";
 import { executeBid, colorForOutcome, type BidLimits } from "./bidder";
+import { writeHeartbeat, isWedged, staleAfterMs } from "./heartbeat";
 
+/** CLI-level options controlling one sentinel run. */
 export interface RunOptions {
-  dryRun: boolean;
-  once: boolean;
-  signal: AbortSignal;
+  dryRun: boolean; // simulate only; never sends a transaction (see BidLimits.dryRun)
+  once: boolean; // run a single tick and return, instead of looping
+  signal: AbortSignal; // abort signal to stop the loop / in-flight sleep
 }
 
 interface PreparedTarget {
@@ -121,6 +135,23 @@ async function buildTickContext(
   return { cacheManager, freeBytes, decayOffsetWei, entries: entryMap };
 }
 
+/**
+ * Runs the sentinel: validates the watchlist and (for live mode) the wallet,
+ * resolves the CacheManager address, then loops polling each watch target and
+ * executing bids as needed until aborted or `opts.once` completes a single
+ * pass.
+ *
+ * Safety nets applied per tick: reconcile-drift halts bidding (live mode
+ * only, unless `cfg.haltOnDrift` is off); a per-codehash cooldown prevents
+ * re-acting on a target whose previous bid is still pending/propagating;
+ * watch targets are periodically re-resolved so a redeploy/re-activation is
+ * picked up without a restart. Assessment reads run in bounded-concurrency
+ * chunks; execution (spending) is strictly serial so the per-window spend cap
+ * is honored in order.
+ *
+ * @param opts - Run mode (dry-run/live), once-vs-loop, and an abort signal.
+ * @returns Resolves when the loop stops (aborted, or after one tick if `once`).
+ */
 export async function runSentinel(opts: RunOptions): Promise<void> {
   const startedAt = Date.now();
   const cfg = loadConfig();
@@ -154,7 +185,11 @@ export async function runSentinel(opts: RunOptions): Promise<void> {
     );
   }
 
+  // Resolve the chain before anything can sign: a bid signed for the wrong
+  // chain id is rejected, so this is also what makes Nova/Orbit runs correct.
+  const chain = await resolveChain();
   const cacheManager = await resolveCacheManager();
+  console.log(chalk.white(`  chain: ${chain.name} (${chain.id})`));
   console.log(chalk.white(`  CacheManager: ${cacheManager}`));
 
   // Batch reads via Multicall3 where available (the throughput fix for large
@@ -177,7 +212,9 @@ export async function runSentinel(opts: RunOptions): Promise<void> {
     maxSpendPerWindowWei: parseEther(cfg.maxSpendPerWindowEth as `${number}`),
     spendWindowSeconds: cfg.spendWindowHours * 3600,
     dryRun: opts.dryRun,
-    receiptTimeoutMs: 120_000,
+    // Shared with the liveness watchdog, which derives its threshold from this
+    // value so it can never fire inside a confirmation wait. See ../config.ts.
+    receiptTimeoutMs: config.receiptTimeoutMs,
   };
 
   console.log(
@@ -194,8 +231,59 @@ export async function runSentinel(opts: RunOptions): Promise<void> {
   // bidCooldownSeconds. This stops the loop from re-recording a dry-run row
   // every tick, and from resubmitting a live bid that is still pending /
   // propagating before the next poll.
-  const cooldownUntil = new Map<string, number>();
+  //
+  // Read from the bid_actions audit trail rather than an in-memory map, so it
+  // survives a restart. That matters because the watchdog below makes restarts
+  // a designed event: an in-memory cooldown would be wiped at precisely the
+  // moment it is protecting a bid that is still propagating.
   const cooldownMs = cfg.bidCooldownSeconds * 1000;
+
+  // Self-exit watchdog.
+  //
+  // Per-tick errors are caught below, so the loop survives a flaky RPC by
+  // design. What it cannot catch is a call that never returns at all: the tick
+  // body simply never completes and the loop stops making progress while the
+  // process stays alive. A container restart policy reacts to a process that
+  // *exits*, not to one that is merely stuck, so nothing would recover it.
+  //
+  // This timer runs on the event loop independently of the tick, and exits the
+  // process once progress stalls past the same threshold `health` uses. Exiting
+  // is what lets `restart: unless-stopped` (or systemd, or a supervisor) bring
+  // it back. Skipped for --once, which has no loop to stall.
+  // Progress is stamped per unit of work, not per tick. A tick containing
+  // several live bids can legitimately last minutes — each bid waits up to
+  // receiptTimeoutMs — and judging on whole-tick completion would let those
+  // durations compound until the watchdog fired mid-bid.
+  let lastProgressAtMs = Date.now();
+  let lastHeartbeatWriteMs = 0;
+  const markProgress = (force = false): void => {
+    lastProgressAtMs = Date.now();
+    // The in-memory value drives the watchdog; the file only needs to be fresh
+    // enough for `health`, so throttle the writes.
+    if (force || lastProgressAtMs - lastHeartbeatWriteMs >= 1_000) {
+      writeHeartbeat(cfg.pollIntervalMs, lastProgressAtMs, config.receiptTimeoutMs);
+      lastHeartbeatWriteMs = lastProgressAtMs;
+    }
+  };
+
+  let watchdog: NodeJS.Timeout | null = null;
+  if (!opts.once) {
+    const limitMs = staleAfterMs(cfg.pollIntervalMs, config.receiptTimeoutMs);
+    watchdog = setInterval(() => {
+      if (!isWedged(lastProgressAtMs, cfg.pollIntervalMs, Date.now(), config.receiptTimeoutMs))
+        return;
+      const stalledFor = Math.round((Date.now() - lastProgressAtMs) / 1000);
+      console.error(
+        chalk.red(
+          `\n  watchdog: no tick completed in ${stalledFor}s (limit ${Math.round(limitMs / 1000)}s) — ` +
+            `exiting so the restart policy can recover\n`
+        )
+      );
+      process.exit(1);
+    }, Math.max(5_000, Math.floor(limitMs / 4)));
+    // Do not let the watchdog alone hold the process open.
+    watchdog.unref?.();
+  }
 
   // Periodically re-resolve program→codehash so a redeploy/re-activation while
   // the loop runs is eventually picked up (a "set-and-forget" tool shouldn't
@@ -235,12 +323,6 @@ export async function runSentinel(opts: RunOptions): Promise<void> {
       if (!opts.once && Date.now() - lastResolveAt > RESOLVE_REFRESH_MS) {
         targets = await refreshTargets(cfg, targets);
         lastResolveAt = Date.now();
-        // Drop cooldown entries for codehashes no longer on the (re-resolved)
-        // watchlist, so a redeploy can't leak stale keys into the map.
-        const live = new Set(targets.map((t) => t.resolved.codehash.toLowerCase()));
-        for (const k of cooldownUntil.keys()) {
-          if (!live.has(k)) cooldownUntil.delete(k);
-        }
       }
 
       const ctx = await buildTickContext(cacheManager);
@@ -262,6 +344,9 @@ export async function runSentinel(opts: RunOptions): Promise<void> {
             )
           ))
         );
+        // A large watchlist assesses in several chunks; each completed chunk is
+        // progress, so a long read phase is not mistaken for a stall either.
+        markProgress();
       }
 
       for (const a of assessments) {
@@ -287,11 +372,17 @@ export async function runSentinel(opts: RunOptions): Promise<void> {
         }
 
         // Cooldown gate: skip silently if we acted on this target recently.
-        const key = a.target.codehash.toLowerCase();
-        if (Date.now() < (cooldownUntil.get(key) ?? 0)) continue;
+        // Sourced from the persisted audit trail, so a restart mid-cooldown
+        // does not forget an in-flight bid.
+        const lastActionAtMs = getLastBidActionAtMs(a.target.codehash);
+        if (lastActionAtMs !== null && Date.now() - lastActionAtMs < cooldownMs) {
+          continue;
+        }
 
         const result = await executeBid(a, limits);
-        cooldownUntil.set(key, Date.now() + cooldownMs);
+        // A live bid can have blocked here for up to receiptTimeoutMs. Stamp
+        // progress now so a slow confirmation is never mistaken for a wedge.
+        markProgress();
         const color = colorForOutcome(result.outcome);
         console.log(
           color(
@@ -304,6 +395,11 @@ export async function runSentinel(opts: RunOptions): Promise<void> {
       console.error(chalk.yellow(`  [${ts()}] tick error: ${err.message}`));
     }
 
+    // Stamp liveness even when the tick threw. A tick that fails and is logged
+    // is the loop working as designed — errors are caught per-tick on purpose.
+    // What "unhealthy" must mean is that ticks stopped happening at all.
+    markProgress(true);
+
     if (opts.once) break;
 
     const elapsed = Date.now() - tickStart;
@@ -311,6 +407,7 @@ export async function runSentinel(opts: RunOptions): Promise<void> {
     await abortableSleep(wait, opts.signal);
   } while (!opts.signal.aborted);
 
+  if (watchdog) clearInterval(watchdog);
   console.log(chalk.cyan("\n  sentinel stopped\n"));
 }
 

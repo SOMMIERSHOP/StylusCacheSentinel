@@ -1,4 +1,15 @@
+/**
+ * ABI fragments for the ArbWasmCache precompile (0x72) and the CacheManager
+ * contract, scoped to exactly the functions/events/errors the sentinel uses.
+ *
+ * @module
+ */
+
 // ArbWasmCache (0x72) + CacheManager ABIs
+/**
+ * ArbWasmCache (precompile 0x72) read-only ABI: cache-manager enumeration and
+ * the per-codehash cached/not-cached check the sentinel polls on every tick.
+ */
 export const arbWasmCacheAbi = [
   {
     name: "allCacheManagers",
@@ -16,6 +27,12 @@ export const arbWasmCacheAbi = [
   },
 ] as const;
 
+/**
+ * CacheManager read-only views and events used for indexing/reconciliation:
+ * cache capacity and queue occupancy, decay rate, pause state, the full bid
+ * queue (getEntries), and the InsertBid/DeleteBid/SetCacheSize/SetDecayRate/
+ * Pause/Unpause events consumed by the indexer.
+ */
 export const cacheManagerAbi = [
   // views
   {
@@ -116,6 +133,13 @@ export const cacheManagerAbi = [
 // Write path (M3/M4). Kept separate from cacheManagerAbi so the bytes32
 // getMinBid overload never collides with the address overload above when
 // viem resolves a call by argument types.
+/**
+ * CacheManager write path plus custom errors (M3/M4). Kept separate from
+ * {@link cacheManagerAbi} so the bytes32-keyed getMinBid overload here never
+ * collides with the address-keyed lookup path when viem resolves a call by
+ * argument types. `placeBid` is keyed on the program ADDRESS (not codehash) —
+ * the deployed CacheManager removed `placeBid(bytes32)` upstream.
+ */
 export const cacheManagerWriteAbi = [
   // The deployed CacheManager keys placeBid on the program ADDRESS (it derives
   // the codehash internally and emits it in InsertBid). An earlier
@@ -146,6 +170,18 @@ export const cacheManagerWriteAbi = [
     inputs: [{ name: "ageInSeconds", type: "uint64" }],
   },
   { type: "error", name: "ProgramNotActivated", inputs: [] },
+  // Selector 0x637d968f. Observed live on Arbitrum One against a program
+  // activated under an older Stylus version. Without this entry viem cannot
+  // decode the revert, and a routine "needs re-activation" outcome surfaces as
+  // an opaque read error instead of an actionable one.
+  {
+    type: "error",
+    name: "ProgramNeedsUpgrade",
+    inputs: [
+      { name: "version", type: "uint16" },
+      { name: "stylusVersion", type: "uint16" },
+    ],
+  },
   {
     type: "error",
     name: "AlreadyCached",

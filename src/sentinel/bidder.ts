@@ -1,7 +1,18 @@
+/**
+ * Submits (or simulates) CacheManager bids for assessments that need one,
+ * applying a strict, ordered stack of fail-safes before any value leaves the
+ * wallet.
+ *
+ * Order: monitor-only (no program address) → per-bid ceiling → per-window
+ * spend cap → dry-run → live submit + receipt confirmation. Every outcome,
+ * including blocked and dry-run ones, is recorded via the bid-action store
+ * for audit/history.
+ *
+ * @module
+ */
 import { formatEther } from "viem";
-import { arbitrum } from "viem/chains";
 import chalk from "chalk";
-import { getClient } from "../provider";
+import { getClient, resolveChain } from "../provider";
 import { getWalletClient, getAccount } from "../wallet";
 import { cacheManagerWriteAbi } from "../abi";
 import {
@@ -11,14 +22,16 @@ import {
 } from "../db/store";
 import type { Assessment } from "./assess";
 
+/** Policy limits and runtime mode enforced by {@link executeBid} for every bid. */
 export interface BidLimits {
   cacheManager: `0x${string}`;
   maxSpendPerWindowWei: bigint;
   spendWindowSeconds: number;
-  dryRun: boolean;
-  receiptTimeoutMs: number;
+  dryRun: boolean; // when true, no transaction is ever sent — see fail-safe 3 below
+  receiptTimeoutMs: number; // how long to wait for confirmation before returning "submitted"
 }
 
+/** Result classification for a bid attempt, used for log coloring and audit records. */
 export type BidOutcome =
   | "dry-run"
   | "blocked"
@@ -26,6 +39,7 @@ export type BidOutcome =
   | "confirmed"
   | "failed";
 
+/** Outcome of one {@link executeBid} call: classification, optional tx hash, and a human-readable note for logging. */
 export interface BidResult {
   outcome: BidOutcome;
   txHash?: `0x${string}`;
@@ -35,6 +49,18 @@ export interface BidResult {
 // Execute (or simulate) a single bid for an assessment that needs one,
 // applying all fail-safes in order: per-bid ceiling, per-window spend cap,
 // dry-run, then live submission with receipt confirmation.
+/**
+ * Executes (or simulates) a single bid for an assessment whose decision says
+ * it needs one. Applies fail-safes in order — monitor-only (no resolvable
+ * program address), per-bid ceiling, per-window spend cap, dry-run — before
+ * ever touching the chain; only then does it submit `placeBid` live and wait
+ * for a receipt. Every outcome (including blocked/dry-run) is persisted via
+ * `recordBidAction`/`updateBidAction`.
+ *
+ * @param a - The assessment with a bid decision to act on.
+ * @param limits - Effective spend/ceiling/mode limits for this bid.
+ * @returns The bid outcome, optional tx hash, and a human-readable note.
+ */
 export async function executeBid(
   a: Assessment,
   limits: BidLimits
@@ -109,13 +135,14 @@ export async function executeBid(
   }
 
   // Live submission.
-  const wallet = getWalletClient();
+  const wallet = await getWalletClient();
   const account = getAccount();
+  const chain = await resolveChain();
   let txHash: `0x${string}`;
   try {
     txHash = await wallet.writeContract({
       account,
-      chain: arbitrum,
+      chain,
       address: limits.cacheManager,
       abi: cacheManagerWriteAbi,
       functionName: "placeBid",
@@ -173,6 +200,12 @@ export async function executeBid(
   }
 }
 
+/**
+ * Maps a bid outcome to the chalk color function used to render its log line.
+ *
+ * @param outcome - The bid outcome to color.
+ * @returns A chalk styling function to wrap the log message with.
+ */
 export function colorForOutcome(outcome: BidOutcome): (s: string) => string {
   switch (outcome) {
     case "confirmed":

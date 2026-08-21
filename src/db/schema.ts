@@ -1,11 +1,35 @@
+/**
+ * SQLite schema definition and version migration for the local indexer database.
+ *
+ * Defines dim tables (programs, codehashes) and fact tables (bids, evictions,
+ * config_events, bid_actions) plus sync bookkeeping tables. Schema changes are
+ * handled by a hard drop-and-recreate keyed on SCHEMA_VERSION — there is no
+ * incremental migration path, so bumping SCHEMA_VERSION wipes prior data on
+ * next open (see dropAllTables).
+ *
+ * @module
+ */
+
 import Database from "better-sqlite3";
 
+/** Current schema version string, stored in sync_meta and checked on every DB open. */
 export const SCHEMA_VERSION = "2";
 
 // v1 had TEXT-hex codehash/program/tx_hash and no UNIQUE(tx_hash, log_index).
 // v2 normalizes programs+codehashes into dim tables, stores hashes as BLOB,
 // and dedupes facts via UNIQUE(tx_hash, log_index). Storage drops ~50%+ and
 // re-running backfill becomes idempotent.
+/**
+ * Ensure the database has the current schema, creating tables/indexes as needed.
+ *
+ * If an existing DB is on a different schema version, all versioned tables are
+ * dropped first (destructive — see dropAllTables) before recreating them; the
+ * bid_actions audit table (M4) is additive and created unconditionally via
+ * `CREATE TABLE IF NOT EXISTS` so it never triggers or suffers a version-bump wipe.
+ * Idempotent: safe to call on every process start.
+ *
+ * @param db - Open better-sqlite3 connection to initialize.
+ */
 export function initSchema(db: Database.Database): void {
   const currentVersion = readSchemaVersion(db);
 
@@ -106,6 +130,10 @@ export function initSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_bid_actions_created ON bid_actions(created_at);
     CREATE INDEX IF NOT EXISTS idx_bid_actions_status  ON bid_actions(status);
+    -- Backs the per-target cooldown lookup, which runs once per tick for every
+    -- target that wants a bid. Additive, like the table itself.
+    CREATE INDEX IF NOT EXISTS idx_bid_actions_codehash
+      ON bid_actions(codehash, created_at);
   `);
 
   db.prepare(
